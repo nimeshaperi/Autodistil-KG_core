@@ -41,6 +41,9 @@ ENV/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Datasets (all datasets should be stored in this directory)
+datasets/ 
+
 # Output files
 output/
 
