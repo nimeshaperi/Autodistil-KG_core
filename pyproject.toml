@@ -16,6 +16,14 @@ dependencies = [
     "redis (>=7.1.0,<8.0.0)"
 ]
 
+[project.optional-dependencies]
+finetune = [
+    "trl>=0.22.0",
+    "unsloth",
+    "transformers",
+    "datasets",
+]
+
 [tool.poetry]
 packages = [{include = "autodistil_kg", from = "src"}]
 

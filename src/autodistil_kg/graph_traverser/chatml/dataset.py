@@ -1,4 +1,5 @@
 """CHATML dataset generation and management."""
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 import json
@@ -70,12 +71,14 @@ class ChatMLDataset:
     
     def save_jsonl(self, filepath: str) -> None:
         """Save dataset to a JSONL file."""
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(self.to_jsonl())
         logger.info(f"Saved {len(self.conversations)} conversations to {filepath}")
     
     def save_json(self, filepath: str) -> None:
         """Save dataset to a JSON file."""
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(self.to_list(), f, indent=2)
         logger.info(f"Saved {len(self.conversations)} conversations to {filepath}")
