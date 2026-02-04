@@ -70,18 +70,18 @@ class ChatMLDataset:
         return "\n".join(lines)
     
     def save_jsonl(self, filepath: str) -> None:
-        """Save dataset to a JSONL file."""
-        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(self.to_jsonl())
-        logger.info(f"Saved {len(self.conversations)} conversations to {filepath}")
+        """Save dataset to a JSONL file. Creates parent directories if needed."""
+        path = Path(filepath).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_jsonl(), encoding="utf-8")
+        logger.info(f"Saved {len(self.conversations)} conversations to {path}")
     
     def save_json(self, filepath: str) -> None:
-        """Save dataset to a JSON file."""
-        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(self.to_list(), f, indent=2)
-        logger.info(f"Saved {len(self.conversations)} conversations to {filepath}")
+        """Save dataset to a JSON file. Creates parent directories if needed."""
+        path = Path(filepath).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_list(), indent=2), encoding="utf-8")
+        logger.info(f"Saved {len(self.conversations)} conversations to {path}")
     
     def load_jsonl(self, filepath: str) -> None:
         """Load dataset from a JSONL file."""

@@ -1,9 +1,14 @@
 """
 Unsloth-based fine-tuner: configurable for Gemma, Llama, Qwen, etc.
-Requires: unsloth, transformers, trl, datasets (install separately for finetuning).
+Requires: unsloth, transformers, trl, datasets (install with: pip install "autodistil-kg[finetune]").
 """
+import importlib.abc
+import importlib.machinery
+import importlib.util
 import json
 import logging
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,15 +24,133 @@ DATASETS_AVAILABLE = None
 Dataset = None
 
 
+def _install_unsloth_import_hook() -> None:
+    """Install hook so unsloth.models._utils gets PreTrainedConfig in its namespace.
+
+    Unsloth's _utils does 'from transformers import PretrainedConfig' but the
+    exec'd config source uses the name PreTrainedConfig; inject the alias so
+    exec(config, globals()) does not raise NameError.
+    """
+    class _UnslothUtilsLoader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            spec = module.__spec__
+            with open(spec.origin, "r", encoding="utf-8") as f:
+                source = f.read()
+            # Inject PreTrainedConfig alias and RopeParameters (if available) so exec(config, globals()) finds them
+            # RopeParameters was removed in transformers 5.x; only inject when present
+            needle = "from transformers import PretrainedConfig"
+            if needle in source and "PreTrainedConfig = PretrainedConfig" not in source:
+                source = source.replace(
+                    needle,
+                    needle + "\nPreTrainedConfig = PretrainedConfig",
+                    1,
+                )
+            if "from transformers.modeling_rope_utils import RopeParameters" not in source and needle in source:
+                try:
+                    from transformers.modeling_rope_utils import RopeParameters  # noqa: F401
+                    source = source.replace(
+                        needle,
+                        needle + "\nfrom transformers.modeling_rope_utils import RopeParameters",
+                        1,
+                    )
+                except ImportError:
+                    # transformers 5.x removed RopeParameters; unsloth may use configs that no longer need it
+                    pass
+            # Skip DynamicCache.__getitem__ patch when transformers has no __getitem__ (e.g. transformers 5.x)
+            _cache_cond = (
+                'if hasattr(transformers.cache_utils, "DynamicCache") and \\\n'
+                "    transformers.cache_utils.DynamicCache.__getitem__.__name__"
+            )
+            _cache_cond_safe = (
+                'if hasattr(transformers.cache_utils, "DynamicCache") and '
+                'hasattr(transformers.cache_utils.DynamicCache, "__getitem__") and \\\n'
+                "    transformers.cache_utils.DynamicCache.__getitem__.__name__"
+            )
+            if _cache_cond in source and _cache_cond_safe not in source:
+                source = source.replace(_cache_cond, _cache_cond_safe, 1)
+            code = compile(source, spec.origin, "exec")
+            exec(code, module.__dict__)
+
+    class _UnslothUtilsFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname != "unsloth.models._utils":
+                return None
+            try:
+                import os
+                spec = importlib.util.find_spec("unsloth")
+                if spec is None or not spec.submodule_search_locations:
+                    return None
+                base = spec.submodule_search_locations[0]
+                origin = os.path.join(base, "models", "_utils.py")
+                if not os.path.isfile(origin):
+                    return None
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    _UnslothUtilsLoader(),
+                    origin=origin,
+                )
+            except Exception:
+                return None
+
+    if not any(type(f).__name__ == "_UnslothUtilsFinder" for f in sys.meta_path):
+        sys.meta_path.insert(0, _UnslothUtilsFinder())
+
+
+def _is_python_dev_headers_error(exc: BaseException) -> bool:
+    """Check if the exception is due to missing Python dev headers (Python.h)."""
+    msg = str(exc).lower()
+    if "python.h" in msg or "compilation terminated" in msg:
+        return True
+    # subprocess.CalledProcessError during unsloth/triton import is almost always
+    # GCC failing due to missing Python.h (Triton compiles C extensions at runtime)
+    if isinstance(exc, subprocess.CalledProcessError):
+        return True
+    cause = exc
+    while getattr(cause, "__cause__", None):
+        cause = cause.__cause__
+        cmsg = str(cause).lower()
+        if "python.h" in cmsg or "compilation terminated" in cmsg:
+            return True
+        if isinstance(cause, subprocess.CalledProcessError):
+            return True
+    return False
+
+
+def _raise_finetune_setup_error(exc: BaseException) -> None:
+    """Raise a clear RuntimeError with setup instructions for finetuning failures."""
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    raise RuntimeError(
+        "Finetuning dependencies failed to load. This is often caused by missing "
+        "Python development headers (needed by Triton/CUDA extensions).\n\n"
+        f"Install them for Python {py_ver}:\n"
+        "  Ubuntu/Debian: sudo apt install python3-dev   # or python3.13-dev\n"
+        "  Fedora:        sudo dnf install python3-devel\n"
+        "  macOS:         xcode-select --install\n\n"
+        "Also ensure the finetune extra is installed:\n"
+        "  pip install 'autodistil-kg[finetune]'   # or: poetry install -E finetune\n\n"
+        f"Original error: {exc}"
+    ) from exc
+
+
 def _check_unsloth():
     global UNSLOTH_AVAILABLE
     if UNSLOTH_AVAILABLE is not None:
         return UNSLOTH_AVAILABLE
+    _install_unsloth_import_hook()
     try:
         from unsloth import FastLanguageModel  # noqa: F401
         from unsloth.chat_templates import get_chat_template, train_on_responses_only  # noqa: F401
         UNSLOTH_AVAILABLE = True
-    except Exception:
+    except subprocess.CalledProcessError as e:
+        if _is_python_dev_headers_error(e):
+            _raise_finetune_setup_error(e)
+        UNSLOTH_AVAILABLE = False
+    except Exception as e:
+        if _is_python_dev_headers_error(e):
+            _raise_finetune_setup_error(e)
         UNSLOTH_AVAILABLE = False
     return UNSLOTH_AVAILABLE
 
@@ -208,8 +331,54 @@ class UnslothFineTuner:
         output_dir: Optional[str] = None,
     ):
         """Load model, prepare data, run training, save to output_dir."""
+        import os
+        import shutil
+
+        # CRITICAL: Set env vars and clear stale cache BEFORE importing unsloth
+        # Unsloth must be imported before trl/transformers/peft to apply patches correctly
+        os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+
+        # Clear stale unsloth compiled cache to avoid torch.compile option incompatibilities
+        # (e.g. cuda.cutlass_epilogue_fusion_enabled was removed in newer PyTorch)
+        cache_dirs = [
+            Path("/tmp/unsloth_compiled_cache"),
+            Path.cwd() / "unsloth_compiled_cache",
+            Path(__file__).parent.parent.parent.parent.parent.parent / "Autodistil-KG_api" / "unsloth_compiled_cache",
+        ]
+        for cache_dir in cache_dirs:
+            if cache_dir.exists():
+                try:
+                    shutil.rmtree(cache_dir)
+                    logger.info("Cleared stale unsloth cache: %s", cache_dir)
+                except Exception as e:
+                    logger.warning("Could not clear unsloth cache %s: %s", cache_dir, e)
+
+        # Install import hook before any unsloth imports
+        _install_unsloth_import_hook()
+
+        # IMPORTANT: Import unsloth FIRST, before trl/transformers/peft
+        # This allows unsloth to apply its patches correctly
+        try:
+            import unsloth  # noqa: F401 - must be imported first to patch other libraries
+        except subprocess.CalledProcessError as e:
+            if _is_python_dev_headers_error(e):
+                _raise_finetune_setup_error(e)
+            raise
+        except Exception as e:
+            if _is_python_dev_headers_error(e):
+                _raise_finetune_setup_error(e)
+            raise
+
+        # Now safe to import trl and transformers (unsloth has patched them)
         if not _check_trl():
             raise RuntimeError("trl is not installed. Install with: pip install trl")
+
+        # Transformers 5.0 renamed AutoModelForVision2Seq -> AutoModelForImageTextToText; unsloth still expects the old name
+        import transformers as _tf
+        if not hasattr(_tf, "AutoModelForVision2Seq"):
+            from transformers import AutoModelForImageTextToText
+            _tf.AutoModelForVision2Seq = AutoModelForImageTextToText  # type: ignore[attr-defined]
+
         from trl import SFTTrainer, SFTConfig
         from unsloth.chat_templates import train_on_responses_only
         self.load_model_and_tokenizer()

@@ -47,7 +47,7 @@ class FineTunerStage(Stage):
         if cfg.model_type is not None:
             model_type = ModelType(cfg.model_type) if isinstance(cfg.model_type, str) else cfg.model_type
         return UnslothFineTunerConfig(
-            model_name=cfg.model_name or "unsloth/gemma-3-270m-it",
+            model_name=cfg.model_name or "unsloth/gemma-2-2b-it",
             model_type=model_type,
             max_seq_length=cfg.max_seq_length,
             train_data_path=train_path,
