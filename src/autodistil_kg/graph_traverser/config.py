@@ -20,6 +20,7 @@ class TraversalStrategy(str, Enum):
     DFS = "dfs"  # Depth-First Search
     RANDOM = "random"
     SEMANTIC = "semantic"  # Semantic-aware traversal using LLM
+    REASONING = "reasoning"  # Deep multi-hop reasoning with subgraph exploration
 
 
 @dataclass
@@ -31,6 +32,8 @@ class TraversalConfig:
     relationship_types: Optional[List[str]] = None  # Filter by relationship types
     node_labels: Optional[List[str]] = None  # Filter by node labels
     seed_node_ids: Optional[List[str]] = None  # Starting nodes
+    reasoning_depth: int = 2  # Subgraph depth for REASONING strategy
+    max_paths_per_node: int = 15  # Max paths to reason over per node
     additional_params: dict = field(default_factory=dict)
 
 

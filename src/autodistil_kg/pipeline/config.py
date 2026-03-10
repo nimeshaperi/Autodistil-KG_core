@@ -79,11 +79,25 @@ class FineTunerStageConfig:
 
 @dataclass
 class EvaluatorStageConfig:
-    """Configuration for the Evaluator stage (stub for future implementation)."""
+    """Configuration for the Evaluator stage."""
     model_path: Optional[str] = None
     eval_dataset_path: Optional[str] = None
     output_report_path: Optional[str] = None
-    metrics: Optional[list] = None
+    metrics: Optional[list] = None  # e.g. ["rouge", "llm_judge"]
+    evalg_mode: str = "internal"
+    # Base model for comparison
+    base_model_provider: Optional[str] = None  # e.g. "ollama", "openai"
+    base_model_name: Optional[str] = None      # e.g. "gemma3:4b", "gpt-4"
+    base_model_api_key: Optional[str] = None
+    base_model_base_url: Optional[str] = None
+    # Graph RAG config
+    graph_rag_config: Optional[Dict[str, Any]] = None
+    # LLM Judge config
+    judge_provider: Optional[str] = None
+    judge_model: Optional[str] = None
+    judge_api_key: Optional[str] = None
+    # Limits
+    max_eval_samples: Optional[int] = None
     additional_params: Dict[str, Any] = field(default_factory=dict)
 
 

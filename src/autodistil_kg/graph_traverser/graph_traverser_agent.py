@@ -19,7 +19,11 @@ from .config import (
 )
 from .prompts import (
     format_semantic_selection_prompt,
-    format_node_context
+    format_node_context,
+    format_path_description,
+    format_path_reasoning_prompt,
+    format_subgraph_synthesis_prompt,
+    format_reasoning_qa_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +103,8 @@ class GraphTraverserAgent:
                 self._traverse_random(start_nodes)
             elif self.config.traversal.strategy == TraversalStrategy.SEMANTIC:
                 self._traverse_semantic(start_nodes)
+            elif self.config.traversal.strategy == TraversalStrategy.REASONING:
+                self._traverse_reasoning(start_nodes)
             else:
                 raise ValueError(f"Unknown traversal strategy: {self.config.traversal.strategy}")
             
@@ -301,6 +307,316 @@ class GraphTraverserAgent:
 
             logger.debug("Semantic: processed %s, candidates=%d", _short_id(selected_node), len(candidates))
     
+    def _traverse_reasoning(self, start_nodes: List[str]) -> None:
+        """
+        Deep reasoning traversal: for each node, extract a depth-N subgraph,
+        reason through each path, synthesize understanding, then generate
+        rich QA pairs for SLM distillation.
+        """
+        visited_set = set()
+        queue: Deque[tuple[str, int]] = deque()
+
+        for node_id in start_nodes:
+            if node_id not in visited_set:
+                queue.append((node_id, 0))
+                visited_set.add(node_id)
+
+        reasoning_depth = self.config.traversal.reasoning_depth
+        max_paths = self.config.traversal.max_paths_per_node
+
+        logger.info(
+            "Reasoning traversal initialized: %d seed nodes, subgraph_depth=%d, max_paths=%d",
+            len(queue), reasoning_depth, max_paths,
+        )
+
+        while queue:
+            if self._should_stop():
+                logger.info("Stopping: reached max_nodes=%d", self.config.traversal.max_nodes)
+                break
+
+            node_id, depth = queue.popleft()
+
+            if self.config.traversal.max_depth and depth > self.config.traversal.max_depth:
+                continue
+
+            self.current_depth = depth
+            self._process_node_reasoning(node_id, reasoning_depth, max_paths)
+
+            # After processing, add unvisited subgraph nodes to the queue
+            # so the traversal expands outward through the graph
+            subgraph = self.graph_db.get_subgraph(
+                node_id,
+                depth=1,
+                relationship_types=self.config.traversal.relationship_types,
+            )
+            for nid in subgraph.get("nodes", {}):
+                if nid not in visited_set:
+                    visited_set.add(nid)
+                    queue.append((nid, depth + 1))
+
+            logger.debug(
+                "Reasoning: processed %s (depth=%d), queue=%d, processed=%d",
+                _short_id(node_id), depth, len(queue), self.visited_count,
+            )
+
+    def _process_node_reasoning(
+        self,
+        node_id: str,
+        reasoning_depth: int,
+        max_paths: int,
+    ) -> None:
+        """
+        Deep reasoning processing for a single node:
+        1. Query depth-N subgraph
+        2. Reason through each path
+        3. Synthesize all path reasonings
+        4. Generate distillation-ready QA pair
+        """
+        existing_state = self.state_storage.get_node_state(node_id)
+        if existing_state and existing_state.state == NodeState.VISITED:
+            logger.debug("Node %s already visited, skipping", _short_id(node_id))
+            return
+
+        logger.info(
+            "[%d/%s] Deep reasoning on node %s (depth=%d, subgraph_depth=%d)...",
+            self.visited_count + 1,
+            self.config.traversal.max_nodes or "∞",
+            _short_id(node_id),
+            self.current_depth,
+            reasoning_depth,
+        )
+
+        self._mark_in_progress(node_id)
+
+        # Step 1: Get the full subgraph around this node
+        subgraph = self.graph_db.get_subgraph(
+            node_id,
+            depth=reasoning_depth,
+            relationship_types=self.config.traversal.relationship_types,
+        )
+
+        center = subgraph["center"]
+        paths = subgraph["paths"]
+        nodes_map = subgraph["nodes"]
+        edges = subgraph["edges"]
+
+        if not center or (not center.get("labels") and not center.get("properties")):
+            logger.warning("Node %s has no data, marking skipped", _short_id(node_id))
+            self._mark_skipped(node_id)
+            return
+
+        logger.info(
+            "  Subgraph: %d nodes, %d edges, %d paths",
+            len(nodes_map), len(edges), len(paths),
+        )
+
+        # Deduplicate paths by their string representation to avoid redundant reasoning
+        unique_paths = []
+        seen_path_keys = set()
+        for path in paths:
+            key = format_path_description(path)
+            if key not in seen_path_keys:
+                seen_path_keys.add(key)
+                unique_paths.append(path)
+
+        # Limit paths
+        if len(unique_paths) > max_paths:
+            # Prefer longer paths (more multi-hop reasoning potential)
+            unique_paths.sort(key=lambda p: len(p), reverse=True)
+            unique_paths = unique_paths[:max_paths]
+
+        logger.info("  Reasoning over %d unique paths...", len(unique_paths))
+
+        # Step 2: Reason through each path
+        path_analyses = []
+        for i, path in enumerate(unique_paths):
+            logger.debug(
+                "  Path %d/%d: %s",
+                i + 1, len(unique_paths), format_path_description(path)[:100],
+            )
+            analysis = self._reason_through_path(center, path)
+            if analysis:
+                path_analyses.append(analysis)
+
+        if not path_analyses:
+            logger.warning("  No path analyses produced for %s, skipping", _short_id(node_id))
+            self._mark_skipped(node_id)
+            return
+
+        # Step 3: Synthesize all path reasonings
+        logger.info("  Synthesizing %d path analyses...", len(path_analyses))
+        synthesis = self._synthesize_subgraph(
+            center, path_analyses, len(nodes_map), len(edges)
+        )
+
+        # Step 4: Generate distillation QA pair
+        logger.info("  Generating QA pair for distillation...")
+        qa_pair = self._generate_reasoning_qa(center, synthesis)
+
+        # Create CHATML conversations
+        # Conv 1: The full reasoning chain (system + synthesis as teaching material)
+        metadata = {
+            "node_id": node_id,
+            "labels": center.get("labels", []),
+            "depth": self.current_depth,
+            "subgraph_nodes": len(nodes_map),
+            "subgraph_edges": len(edges),
+            "paths_analyzed": len(path_analyses),
+            "strategy": "reasoning",
+            "timestamp": time.time(),
+        }
+
+        # Create the main distillation conversation from the QA pair
+        conversation = ChatMLFormatter.create_conversation_pair(
+            prompt=qa_pair["question"],
+            response=qa_pair["answer"],
+            system_message=self.config.dataset.system_message,
+            metadata=metadata if self.config.dataset.include_metadata else None,
+        )
+        self.dataset.add_conversation(conversation)
+
+        # Also add the synthesis as a second training example (teach the model the deep reasoning)
+        synthesis_prompt = (
+            f"Explain everything you know about {center.get('properties', {}).get('name', center.get('labels', ['this entity'])[0] if center.get('labels') else 'this entity')} "
+            f"and its relationships in the knowledge graph, including multi-hop inferences."
+        )
+        synthesis_conv = ChatMLFormatter.create_conversation_pair(
+            prompt=synthesis_prompt,
+            response=synthesis,
+            system_message=self.config.dataset.system_message,
+            metadata={**metadata, "type": "synthesis"} if self.config.dataset.include_metadata else None,
+        )
+        self.dataset.add_conversation(synthesis_conv)
+
+        try:
+            self.state_storage.mark_visited(node_id, metadata={"processed": True, "strategy": "reasoning"})
+        except Exception as e:
+            logger.warning("Failed to persist visited state for %s: %s", _short_id(node_id), e)
+        self.visited_count += 1
+
+        logger.info(
+            "  ✓ Node %s done → 2 conversations (visited=%d)",
+            _short_id(node_id), self.visited_count,
+        )
+
+    def _reason_through_path(
+        self,
+        center_node: Dict[str, Any],
+        path: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """
+        Use LLM to reason through a single path from the subgraph.
+        Returns the LLM's step-by-step reasoning analysis.
+        """
+        prompt = format_path_reasoning_prompt(center_node, path)
+        messages = []
+
+        if self.config.dataset.system_message:
+            messages.append(LLMMessage(
+                role="system",
+                content="You are a knowledge graph reasoning engine. Analyze paths deeply and extract multi-step knowledge.",
+            ))
+
+        messages.append(LLMMessage(role="user", content=prompt))
+
+        try:
+            response = self.llm_client.generate(
+                messages, temperature=0.4, max_tokens=800
+            )
+            return response.strip()
+        except Exception as e:
+            logger.warning("Error reasoning through path: %s", e)
+            return None
+
+    def _synthesize_subgraph(
+        self,
+        center_node: Dict[str, Any],
+        path_analyses: List[str],
+        num_nodes: int,
+        num_edges: int,
+    ) -> str:
+        """
+        Synthesize multiple path-level analyses into a comprehensive understanding.
+        """
+        prompt = format_subgraph_synthesis_prompt(
+            center_node, path_analyses, num_nodes, num_edges
+        )
+        messages = []
+
+        if self.config.dataset.system_message:
+            messages.append(LLMMessage(
+                role="system",
+                content="You are a knowledge synthesis engine. Combine multiple analyses into comprehensive, educational summaries.",
+            ))
+
+        messages.append(LLMMessage(role="user", content=prompt))
+
+        try:
+            response = self.llm_client.generate(
+                messages, temperature=0.5, max_tokens=1500
+            )
+            return response.strip()
+        except Exception as e:
+            logger.error("Error synthesizing subgraph: %s", e)
+            return "Error during synthesis: " + str(e)
+
+    def _generate_reasoning_qa(
+        self,
+        center_node: Dict[str, Any],
+        synthesis: str,
+    ) -> Dict[str, str]:
+        """
+        Generate a high-quality QA pair from the synthesis, suitable for SLM distillation.
+        Returns dict with 'question' and 'answer' keys.
+        """
+        prompt = format_reasoning_qa_prompt(center_node, synthesis)
+        messages = []
+
+        if self.config.dataset.system_message:
+            messages.append(LLMMessage(
+                role="system",
+                content="You are a training data generator. Create high-quality question-answer pairs for language model training.",
+            ))
+
+        messages.append(LLMMessage(role="user", content=prompt))
+
+        try:
+            response = self.llm_client.generate(
+                messages, temperature=0.6, max_tokens=1200
+            )
+
+            # Parse the QA pair from the response
+            question = ""
+            answer = ""
+
+            if "**Question:**" in response and "**Answer:**" in response:
+                parts = response.split("**Answer:**", 1)
+                question = parts[0].replace("**Question:**", "").strip()
+                answer = parts[1].strip()
+            elif "Question:" in response and "Answer:" in response:
+                parts = response.split("Answer:", 1)
+                question = parts[0].replace("Question:", "").strip()
+                answer = parts[1].strip()
+            else:
+                # Fallback: use the synthesis as answer and generate a simple question
+                name = (
+                    center_node.get("properties", {}).get("name")
+                    or center_node.get("properties", {}).get("title")
+                    or ", ".join(center_node.get("labels", ["this entity"]))
+                )
+                question = f"What can you tell me about {name} and its relationships, including any multi-step inferences?"
+                answer = response
+
+            return {"question": question, "answer": answer}
+
+        except Exception as e:
+            logger.error("Error generating QA pair: %s", e)
+            name = center_node.get("properties", {}).get("name", "this entity")
+            return {
+                "question": f"What do you know about {name}?",
+                "answer": synthesis,
+            }
+
     def _select_semantic_node(
         self,
         candidates: List[str],

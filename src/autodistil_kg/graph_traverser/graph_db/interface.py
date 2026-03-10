@@ -71,6 +71,25 @@ class GraphDatabase(ABC):
         pass
     
     @abstractmethod
+    def get_subgraph(
+        self,
+        node_id: str,
+        depth: int = 2,
+        relationship_types: Optional[List[str]] = None,
+        limit: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Get the subgraph around a node up to a given depth.
+
+        Returns a dict with:
+            - 'center': The center node dict
+            - 'nodes': Dict mapping node_id -> node dict
+            - 'edges': List of edge dicts with source_id, target_id, type, properties
+            - 'paths': List of paths, each path is a list of alternating node/edge dicts
+        """
+        pass
+
+    @abstractmethod
     def get_node_count(self) -> int:
         """Get total number of nodes in the graph."""
         pass
