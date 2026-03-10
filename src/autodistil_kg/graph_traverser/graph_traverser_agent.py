@@ -151,7 +151,9 @@ class GraphTraverserAgent:
             labels = ":".join(self.config.traversal.node_labels)
             query = f"MATCH (n:{labels})"
         
-        query += " RETURN elementId(n) as node_id LIMIT 100"
+        # Use the graph_db's compatible ID expression
+        id_expr = getattr(self.graph_db, '_node_id_expr', lambda v: f"toString(id({v}))")("n")
+        query += f" RETURN {id_expr} as node_id LIMIT 100"
         
         try:
             results = self.graph_db.query(query, params)

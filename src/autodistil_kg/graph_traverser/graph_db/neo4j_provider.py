@@ -13,7 +13,7 @@ logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
 class Neo4jGraphDatabase(GraphDatabase):
     """Neo4j implementation of the GraphDatabase interface."""
-    
+
     def __init__(
         self,
         uri: str,
@@ -23,7 +23,7 @@ class Neo4jGraphDatabase(GraphDatabase):
     ):
         """
         Initialize Neo4j connection.
-        
+
         Args:
             uri: Neo4j connection URI (e.g., "bolt://localhost:7687")
             user: Neo4j username
@@ -35,7 +35,8 @@ class Neo4jGraphDatabase(GraphDatabase):
         self.password = password
         self.database = database
         self.driver: Optional[Driver] = None
-    
+        self._has_element_id = False  # True when Neo4j >= 4.4
+
     def connect(self) -> None:
         """Establish connection to Neo4j."""
         try:
@@ -46,9 +47,33 @@ class Neo4jGraphDatabase(GraphDatabase):
             # Verify connectivity
             self.driver.verify_connectivity()
             logger.info(f"Connected to Neo4j at {self.uri}")
+            self._detect_element_id_support()
         except Exception as e:
             logger.error(f"Failed to connect to Neo4j: {e}")
             raise
+
+    def _detect_element_id_support(self) -> None:
+        """Detect whether the server supports elementId() (Neo4j >= 4.4)."""
+        try:
+            with self._get_session() as session:
+                session.run("MATCH (n) RETURN elementId(n) LIMIT 0").consume()
+            self._has_element_id = True
+            logger.debug("Neo4j server supports elementId()")
+        except Exception:
+            self._has_element_id = False
+            logger.debug("Neo4j server does not support elementId(), using id()")
+
+    def _node_id_expr(self, var: str = "n") -> str:
+        """Return the Cypher expression for getting a node's stable ID."""
+        if self._has_element_id:
+            return f"elementId({var})"
+        return f"toString(id({var}))"
+
+    def _node_id_match(self, var: str, param: str, node_id: str) -> str:
+        """Return a WHERE clause fragment to match a node by ID."""
+        if self._has_element_id and ":" in (node_id or ""):
+            return f"elementId({var}) = ${param}"
+        return f"id({var}) = toInteger(${param})"
     
     def disconnect(self) -> None:
         """Close Neo4j connection."""
@@ -58,25 +83,27 @@ class Neo4jGraphDatabase(GraphDatabase):
             logger.info("Disconnected from Neo4j")
     
     def _get_session(self):
-        """Get a Neo4j session."""
+        """Get a Neo4j session, omitting database param for older servers."""
         if not self.driver:
             raise RuntimeError("Not connected to Neo4j. Call connect() first.")
-        return self.driver.session(database=self.database)
+        if self.database:
+            try:
+                return self.driver.session(database=self.database)
+            except TypeError:
+                # Very old driver versions may not accept database kwarg
+                return self.driver.session()
+        return self.driver.session()
     
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a node by its ID (elementId or legacy integer id)."""
-        # Neo4j 5+: use elementId (stable). Fallback: legacy id() for numeric strings.
-        if node_id and ":" in node_id:
-            query = "MATCH (n) WHERE elementId(n) = $node_id RETURN n, labels(n) as labels, elementId(n) as eid LIMIT 1"
-            param = node_id
-        else:
-            query = "MATCH (n) WHERE id(n) = toInteger($node_id) RETURN n, labels(n) as labels, elementId(n) as eid LIMIT 1"
-            param = node_id
-        
+        id_expr = self._node_id_expr("n")
+        where = self._node_id_match("n", "node_id", node_id)
+        query = f"MATCH (n) WHERE {where} RETURN n, labels(n) as labels, {id_expr} as eid LIMIT 1"
+
         with self._get_session() as session:
-            result = session.run(query, node_id=param)
+            result = session.run(query, node_id=node_id)
             record = result.single()
-            
+
             if record:
                 node = dict(record["n"])
                 eid = record.get("eid")
@@ -98,54 +125,45 @@ class Neo4jGraphDatabase(GraphDatabase):
             rel_filter = f":{':'.join(relationship_types)}"
         else:
             rel_filter = ""
-        
+
         limit_clause = f"LIMIT {limit}" if limit else ""
-        
-        if node_id and ":" in node_id:
-            where_clause = "elementId(n) = $node_id"
-            param = node_id
-        else:
-            where_clause = "id(n) = toInteger($node_id)"
-            param = node_id
-        
+        where_clause = self._node_id_match("n", "node_id", node_id)
+        id_expr = self._node_id_expr("neighbor")
+
         query = f"""
         MATCH (n)-[r{rel_filter}]-(neighbor)
         WHERE {where_clause}
-        RETURN neighbor, labels(neighbor) as labels, elementId(neighbor) as neighbor_eid, id(neighbor) as neighbor_id,
+        RETURN neighbor, labels(neighbor) as labels, {id_expr} as neighbor_eid,
                type(r) as relationship_type, properties(r) as rel_properties
         {limit_clause}
         """
-        
+
         with self._get_session() as session:
-            result = session.run(query, node_id=param)
+            result = session.run(query, node_id=node_id)
             neighbors = []
-            
+
             for record in result:
                 neighbor = dict(record["neighbor"])
                 eid = record.get("neighbor_eid")
                 neighbors.append({
-                    "id": str(eid) if eid is not None else str(record.get("neighbor_id", "")),
+                    "id": str(eid) if eid is not None else node_id,
                     "labels": record["labels"],
                     "properties": neighbor,
                     "relationship_type": record["relationship_type"],
                     "relationship_properties": record["rel_properties"]
                 })
-            
+
             return neighbors
     
     def get_node_properties(self, node_id: str) -> Dict[str, Any]:
         """Get all properties of a node."""
-        if node_id and ":" in node_id:
-            query = "MATCH (n) WHERE elementId(n) = $node_id RETURN properties(n) as props LIMIT 1"
-            param = node_id
-        else:
-            query = "MATCH (n) WHERE id(n) = toInteger($node_id) RETURN properties(n) as props LIMIT 1"
-            param = node_id
-        
+        where = self._node_id_match("n", "node_id", node_id)
+        query = f"MATCH (n) WHERE {where} RETURN properties(n) as props LIMIT 1"
+
         with self._get_session() as session:
-            result = session.run(query, node_id=param)
+            result = session.run(query, node_id=node_id)
             record = result.single()
-            
+
             if record:
                 return dict(record["props"])
             return {}
@@ -160,27 +178,24 @@ class Neo4jGraphDatabase(GraphDatabase):
             rel_filter = f":{':'.join(relationship_types)}"
         else:
             rel_filter = ""
-        
-        if node_id and ":" in node_id:
-            where_clause = "elementId(n) = $node_id"
-            param = node_id
-        else:
-            where_clause = "id(n) = toInteger($node_id)"
-            param = node_id
-        
+
+        where_clause = self._node_id_match("n", "node_id", node_id)
+        start_id_expr = self._node_id_expr("startNode(r)")
+        end_id_expr = self._node_id_expr("endNode(r)")
+
         query = f"""
         MATCH (n)-[r{rel_filter}]-(other)
         WHERE {where_clause}
         RETURN type(r) as type, properties(r) as properties,
-               elementId(startNode(r)) as start_id, elementId(endNode(r)) as end_id,
+               {start_id_expr} as start_id, {end_id_expr} as end_id,
                labels(startNode(r)) as start_labels,
                labels(endNode(r)) as end_labels
         """
-        
+
         with self._get_session() as session:
-            result = session.run(query, node_id=param)
+            result = session.run(query, node_id=node_id)
             relationships = []
-            
+
             for record in result:
                 relationships.append({
                     "type": record["type"],
@@ -190,7 +205,7 @@ class Neo4jGraphDatabase(GraphDatabase):
                     "start_labels": record["start_labels"],
                     "end_labels": record["end_labels"]
                 })
-            
+
             return relationships
     
     def query(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -217,12 +232,11 @@ class Neo4jGraphDatabase(GraphDatabase):
         else:
             rel_filter = ""
 
-        if node_id and ":" in node_id:
-            where_clause = "elementId(center) = $node_id"
-            param = node_id
-        else:
-            where_clause = "id(center) = toInteger($node_id)"
-            param = node_id
+        where_clause = self._node_id_match("center", "node_id", node_id)
+        id_expr_n = self._node_id_expr("n")
+        id_expr_center = self._node_id_expr("center")
+        id_expr_start = self._node_id_expr("startNode(rel)")
+        id_expr_end = self._node_id_expr("endNode(rel)")
 
         limit_clause = f"LIMIT {limit}" if limit else "LIMIT 500"
 
@@ -232,25 +246,25 @@ class Neo4jGraphDatabase(GraphDatabase):
         WHERE {where_clause}
         WITH path, center, connected,
              [n IN nodes(path) | {{
-                 id: elementId(n),
+                 id: {id_expr_n},
                  labels: labels(n),
                  properties: properties(n)
              }}] AS path_nodes,
              [rel IN relationships(path) | {{
-                 source_id: elementId(startNode(rel)),
-                 target_id: elementId(endNode(rel)),
+                 source_id: {id_expr_start},
+                 target_id: {id_expr_end},
                  type: type(rel),
                  properties: properties(rel)
              }}] AS path_rels
         RETURN path_nodes, path_rels,
-               elementId(center) AS center_id,
+               {id_expr_center} AS center_id,
                labels(center) AS center_labels,
                properties(center) AS center_props
         {limit_clause}
         """
 
         with self._get_session() as session:
-            result = session.run(query, node_id=param)
+            result = session.run(query, node_id=node_id)
 
             nodes_map: Dict[str, Dict[str, Any]] = {}
             edges_list: List[Dict[str, Any]] = []
