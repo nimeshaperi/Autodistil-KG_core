@@ -59,7 +59,7 @@ Stages share a **pipeline context**: paths and optional in-memory data (e.g. `ch
 
 - **Graph Traverser**: Neo4j graph database, Redis (for traversal state), an LLM (OpenAI, Gemini, Claude, Ollama, or vLLM). See [example.env](example.env) for required env vars.
 - **ChatML Converter**: No extra services; reads/writes JSONL.
-- **FineTuner**: Unsloth and related ML stack (`unsloth`, `trl`, `datasets`, `transformers`). GPU recommended for training.
+- **FineTuner**: Unsloth and related ML stack (`unsloth`, `trl`, `datasets`, `transformers`). GPU recommended for training. **System requirement**: Python development headers (`python3-dev` or `python3.13-dev`) for Triton/CUDA extensions.
 
 The project declares `neo4j` in `pyproject.toml`. Other providers (Redis, LLM SDKs, Unsloth) are used by the respective modules; install them as needed (see [Installation](#installation)).
 
@@ -75,7 +75,8 @@ poetry install   # or: make install
 
 **Optional extras:**
 - Graph Traverser (Neo4j, Redis, LLM): `poetry add python-dotenv`
-- FineTuner (Unsloth): see `scripts/finetuning/` or `pip install unsloth`
+- FineTuner (Unsloth): `poetry install -E finetune` or `pip install "autodistil-kg[finetune]"`  
+  - **Required**: Python dev headers: `sudo apt install python3-dev` (Ubuntu/Debian) or `python3.13-dev` for Python 3.13
 
 ---
 

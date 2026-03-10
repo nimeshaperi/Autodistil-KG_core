@@ -54,7 +54,7 @@ class UnslothFineTunerConfig:
     """Configuration for Unsloth-based fine-tuning."""
 
     # Model
-    model_name: str  # e.g. "unsloth/gemma-3-270m-it", "unsloth/llama-3.2-3b"
+    model_name: str  # e.g. "unsloth/gemma-2-2b-it", "unsloth/llama-3.2-3b"
     model_type: Optional[ModelType] = None  # Inferred from model_name if None
     max_seq_length: int = 2048
     load_in_4bit: bool = True

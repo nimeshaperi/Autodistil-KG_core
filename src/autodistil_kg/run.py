@@ -100,7 +100,7 @@ def _config_from_data(data: dict, base_dir: Path) -> PipelineConfig:
         if not d:
             return None
         return FineTunerStageConfig(
-            model_name=d.get("model_name", "unsloth/gemma-3-270m-it"),
+            model_name=d.get("model_name", "unsloth/gemma-2-2b-it"),
             model_type=d.get("model_type"),
             train_data_path=_resolve_path(d.get("train_data_path"), base_dir),
             eval_data_path=_resolve_path(d.get("eval_data_path"), base_dir),
@@ -153,7 +153,7 @@ def _parse_args():
     p.add_argument(
         "--model-name",
         type=str,
-        default="unsloth/gemma-3-270m-it",
+        default="unsloth/gemma-2-2b-it",
         help="Model for finetuner (default: %(default)s)",
     )
     p.add_argument(
@@ -267,7 +267,7 @@ def _config_from_json(path: str, base_dir: Path | None = None) -> PipelineConfig
         if not d:
             return None
         return FineTunerStageConfig(
-            model_name=d.get("model_name", "unsloth/gemma-3-270m-it"),
+            model_name=d.get("model_name", "unsloth/gemma-2-2b-it"),
             model_type=d.get("model_type"),
             train_data_path=_resolve_path(d.get("train_data_path"), base),
             eval_data_path=_resolve_path(d.get("eval_data_path"), base),
