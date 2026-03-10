@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -56,13 +56,10 @@ class EvalSystemConfig:
     # When set, EvalG can consume predictions directly instead of generating them.
     predictions_path: Optional[str] = None
 
-    extra: Dict[str, Any] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
-        if data.get("extra") is None:
-            data["extra"] = {}
-        return data
+        return asdict(self)
 
 
 def run_evalg(
