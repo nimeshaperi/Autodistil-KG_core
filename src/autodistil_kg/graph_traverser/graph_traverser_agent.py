@@ -452,6 +452,25 @@ class GraphTraverserAgent:
             "  Subgraph: %d nodes, %d edges, %d paths",
             len(nodes_map), len(edges), len(paths),
         )
+
+        # Build lightweight neighbor/edge summaries for the UI
+        subgraph_nodes = [
+            {
+                "id": _short_id(str(nid)),
+                "labels": ndata.get("labels", []),
+            }
+            for nid, ndata in nodes_map.items()
+            if str(nid) != str(node_id)
+        ]
+        subgraph_edges = [
+            {
+                "source": _short_id(str(e.get("source_id", ""))),
+                "target": _short_id(str(e.get("target_id", ""))),
+                "type": e.get("type", ""),
+            }
+            for e in edges
+        ]
+
         _emit_traversal_event(
             "subgraph_loaded",
             node_id=_short_id(node_id),
@@ -461,6 +480,8 @@ class GraphTraverserAgent:
             path_count=len(paths),
             visited=self.visited_count + 1,
             total=self.config.traversal.max_nodes or 0,
+            nodes=subgraph_nodes,
+            edges=subgraph_edges,
         )
 
         # Deduplicate paths by their string representation to avoid redundant reasoning
@@ -775,10 +796,26 @@ class GraphTraverserAgent:
         
         # Get neighbors for context
         neighbors = self.graph_db.get_neighbors(node_id, limit=5)
-        
+
+        # Emit neighbor data so the UI can render relationships
+        neighbor_summaries = [
+            {
+                "id": _short_id(str(n["id"])),
+                "labels": n.get("labels", []),
+                "relationship_type": n.get("relationship_type", ""),
+            }
+            for n in neighbors
+        ]
+        _emit_traversal_event(
+            "neighbors_loaded",
+            node_id=_short_id(node_id),
+            labels=node.get("labels", []),
+            neighbors=neighbor_summaries,
+        )
+
         # Generate prompt using seed prompts or default
         prompt = self._generate_prompt(node, neighbors)
-        
+
         _emit_traversal_event(
             "node_start",
             node_id=_short_id(node_id),
