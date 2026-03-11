@@ -1,15 +1,16 @@
 """
 Scorers: compute metrics comparing predictions against reference answers.
 
+Uses DeepEval for robust, production-grade evaluation metrics including
+answer relevancy, faithfulness, correctness (G-Eval), and hallucination.
+
 Each scorer returns a dict of named float scores so multiple sub-metrics
-(e.g. rouge-1, rouge-2, rouge-L) can be reported from a single scorer.
+can be reported from a single scorer.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -28,147 +29,216 @@ class Scorer(ABC):
         """Score a single prediction against a reference answer."""
 
 
-class RougeScorer(Scorer):
-    """ROUGE-1 / ROUGE-2 / ROUGE-L F1 scores via the ``rouge-score`` library."""
+class AnswerRelevancyScorer(Scorer):
+    """Measures how relevant the generated answer is to the question using DeepEval."""
 
-    name = "rouge"
+    name = "answer_relevancy"
 
-    def __init__(self) -> None:
-        from rouge_score import rouge_scorer as _rs
+    def __init__(self, model: Optional[str] = None) -> None:
+        from deepeval.metrics import AnswerRelevancyMetric
+        from deepeval.test_case import LLMTestCase
 
-        self._scorer = _rs.RougeScorer(
-            ["rouge1", "rouge2", "rougeL"], use_stemmer=True
-        )
+        self._metric_cls = AnswerRelevancyMetric
+        self._test_case_cls = LLMTestCase
+        self._model = model
 
     def score(
         self, prediction: str, reference: str, question: str
     ) -> Dict[str, float]:
-        scores = self._scorer.score(reference, prediction)
-        return {
-            "rouge1": round(scores["rouge1"].fmeasure, 4),
-            "rouge2": round(scores["rouge2"].fmeasure, 4),
-            "rougeL": round(scores["rougeL"].fmeasure, 4),
+        try:
+            metric = self._metric_cls(
+                threshold=0.5,
+                **({"model": self._model} if self._model else {}),
+            )
+            test_case = self._test_case_cls(
+                input=question,
+                actual_output=prediction,
+                expected_output=reference,
+            )
+            metric.measure(test_case)
+            return {"answer_relevancy": round(metric.score, 4)}
+        except Exception as e:
+            logger.warning("AnswerRelevancyScorer failed: %s", e)
+            return {"answer_relevancy": 0.0}
+
+
+class CorrectnessScorer(Scorer):
+    """G-Eval based correctness scoring using DeepEval.
+
+    Evaluates accuracy, completeness, and relevance on a 1-5 scale.
+    This replaces the custom LLM judge with DeepEval's G-Eval framework.
+    """
+
+    name = "correctness"
+
+    def __init__(self, model: Optional[str] = None) -> None:
+        from deepeval.metrics import GEval
+        from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+
+        self._geval_cls = GEval
+        self._test_case_cls = LLMTestCase
+        self._params = LLMTestCaseParams
+        self._model = model
+
+    def score(
+        self, prediction: str, reference: str, question: str
+    ) -> Dict[str, float]:
+        results: Dict[str, float] = {}
+        test_case = self._test_case_cls(
+            input=question,
+            actual_output=prediction,
+            expected_output=reference,
+        )
+
+        criteria = {
+            "accuracy": "Determine whether the prediction contains correct information consistent with the reference answer. Score 0 if completely wrong, 1 if perfectly accurate.",
+            "completeness": "Determine whether the prediction covers all key points present in the reference answer. Score 0 if nothing is covered, 1 if fully complete.",
+            "relevance": "Determine whether the prediction is focused on answering the question asked. Score 0 if completely off-topic, 1 if perfectly relevant.",
         }
 
-
-class LLMJudgeScorer(Scorer):
-    """Uses an LLM to rate a prediction on accuracy, completeness, and relevance."""
-
-    name = "llm_judge"
-
-    _PROMPT_TEMPLATE = """\
-You are an expert evaluator. Given a question, a reference (gold) answer, and a \
-candidate prediction, rate the prediction on the following dimensions using a \
-1-5 integer scale (1 = very poor, 5 = excellent):
-
-- **accuracy**: Does the prediction contain correct information consistent with the reference?
-- **completeness**: Does the prediction cover all key points in the reference?
-- **relevance**: Is the prediction focused on answering the question?
-
-Return ONLY a JSON object with these three keys and integer values. Example:
-{{"accuracy": 4, "completeness": 3, "relevance": 5}}
-
-Question:
-{question}
-
-Reference answer:
-{reference}
-
-Candidate prediction:
-{prediction}
-
-JSON rating:"""
-
-    def __init__(
-        self,
-        provider: str,
-        model: Optional[str] = None,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-    ) -> None:
-        from ..llm.config import LLMConfig
-        from ..llm.factory import create_llm_client
-
-        config = LLMConfig(
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-        )
-        self._client = create_llm_client(config)
-
-    def score(
-        self, prediction: str, reference: str, question: str
-    ) -> Dict[str, float]:
-        from ..llm.interface import LLMMessage
-
-        prompt = self._PROMPT_TEMPLATE.format(
-            question=question,
-            reference=reference,
-            prediction=prediction,
-        )
-        messages = [LLMMessage(role="user", content=prompt)]
-
-        for attempt in range(3):
+        for dim, criterion in criteria.items():
             try:
-                raw = self._client.generate(messages, temperature=0.0, max_tokens=128)
-                ratings = self._parse_ratings(raw)
-                avg = sum(ratings.values()) / len(ratings) if ratings else 0.0
-                return {
-                    "judge_accuracy": ratings.get("accuracy", 0.0),
-                    "judge_completeness": ratings.get("completeness", 0.0),
-                    "judge_relevance": ratings.get("relevance", 0.0),
-                    "judge_avg": round(avg, 2),
-                }
-            except Exception:
-                if attempt == 2:
-                    logger.warning("LLM judge failed after 3 attempts; returning zeros")
-                    return {
-                        "judge_accuracy": 0.0,
-                        "judge_completeness": 0.0,
-                        "judge_relevance": 0.0,
-                        "judge_avg": 0.0,
-                    }
+                metric = self._geval_cls(
+                    name=dim,
+                    criteria=criterion,
+                    evaluation_params=[
+                        self._params.INPUT,
+                        self._params.ACTUAL_OUTPUT,
+                        self._params.EXPECTED_OUTPUT,
+                    ],
+                    threshold=0.5,
+                    **({"model": self._model} if self._model else {}),
+                )
+                metric.measure(test_case)
+                results[f"judge_{dim}"] = round(metric.score, 4)
+            except Exception as e:
+                logger.warning("GEval %s failed: %s", dim, e)
+                results[f"judge_{dim}"] = 0.0
 
-        # Unreachable but keeps the type checker happy.
-        return {"judge_accuracy": 0.0, "judge_completeness": 0.0, "judge_relevance": 0.0, "judge_avg": 0.0}
+        if results:
+            vals = [v for v in results.values() if v > 0]
+            results["judge_avg"] = round(sum(vals) / len(vals), 4) if vals else 0.0
 
-    @staticmethod
-    def _parse_ratings(raw: str) -> Dict[str, float]:
-        """Extract the JSON ratings object from raw LLM output."""
-        # Try to find a JSON block in the response.
-        match = re.search(r"\{[^}]+\}", raw)
-        if not match:
-            raise ValueError(f"No JSON object found in LLM judge response: {raw!r}")
-        data = json.loads(match.group())
-        return {
-            "accuracy": float(data["accuracy"]),
-            "completeness": float(data["completeness"]),
-            "relevance": float(data["relevance"]),
-        }
+        return results
+
+
+class FaithfulnessScorer(Scorer):
+    """Measures factual consistency of the prediction against the reference."""
+
+    name = "faithfulness"
+
+    def __init__(self, model: Optional[str] = None) -> None:
+        from deepeval.metrics import FaithfulnessMetric
+        from deepeval.test_case import LLMTestCase
+
+        self._metric_cls = FaithfulnessMetric
+        self._test_case_cls = LLMTestCase
+        self._model = model
+
+    def score(
+        self, prediction: str, reference: str, question: str
+    ) -> Dict[str, float]:
+        try:
+            metric = self._metric_cls(
+                threshold=0.5,
+                **({"model": self._model} if self._model else {}),
+            )
+            test_case = self._test_case_cls(
+                input=question,
+                actual_output=prediction,
+                retrieval_context=[reference],
+            )
+            metric.measure(test_case)
+            return {"faithfulness": round(metric.score, 4)}
+        except Exception as e:
+            logger.warning("FaithfulnessScorer failed: %s", e)
+            return {"faithfulness": 0.0}
+
+
+class HallucinationScorer(Scorer):
+    """Detects hallucinated content in predictions using DeepEval."""
+
+    name = "hallucination"
+
+    def __init__(self, model: Optional[str] = None) -> None:
+        from deepeval.metrics import HallucinationMetric
+        from deepeval.test_case import LLMTestCase
+
+        self._metric_cls = HallucinationMetric
+        self._test_case_cls = LLMTestCase
+        self._model = model
+
+    def score(
+        self, prediction: str, reference: str, question: str
+    ) -> Dict[str, float]:
+        try:
+            metric = self._metric_cls(
+                threshold=0.5,
+                **({"model": self._model} if self._model else {}),
+            )
+            test_case = self._test_case_cls(
+                input=question,
+                actual_output=prediction,
+                context=[reference],
+            )
+            metric.measure(test_case)
+            # HallucinationMetric returns score where higher = more hallucination
+            # Invert so higher = better (less hallucination)
+            return {"hallucination": round(1.0 - metric.score, 4)}
+        except Exception as e:
+            logger.warning("HallucinationScorer failed: %s", e)
+            return {"hallucination": 0.0}
 
 
 def build_scorers(
     metrics: List[str],
     judge_config: Optional[Dict[str, Any]] = None,
 ) -> List[Scorer]:
-    """Instantiate scorers from a list of metric names."""
+    """Instantiate scorers from a list of metric names.
+
+    Available metrics:
+      - "answer_relevancy": DeepEval AnswerRelevancyMetric
+      - "correctness": DeepEval GEval for accuracy/completeness/relevance (replaces llm_judge)
+      - "faithfulness": DeepEval FaithfulnessMetric
+      - "hallucination": DeepEval HallucinationMetric
+
+    Backward-compatible aliases:
+      - "llm_judge" -> "correctness"
+      - "rouge" -> "answer_relevancy" (closest semantic equivalent)
+    """
+    # Resolve the judge model from config (e.g. "gpt-4o", "claude-3-5-sonnet")
+    judge_model = None
+    if judge_config:
+        # DeepEval model string format: provider/model or just model
+        provider = judge_config.get("provider", "")
+        model = judge_config.get("model", "")
+        if provider and model:
+            judge_model = model  # DeepEval handles provider via env vars
+        elif model:
+            judge_model = model
+
+    # Metric name aliases for backward compatibility
+    ALIASES: Dict[str, str] = {
+        "rouge": "answer_relevancy",
+        "llm_judge": "correctness",
+    }
+
     scorers: List[Scorer] = []
+    seen: set[str] = set()
     for name in metrics:
-        if name == "rouge":
-            scorers.append(RougeScorer())
-        elif name == "llm_judge":
-            if not judge_config:
-                logger.warning("llm_judge metric requested but no judge_config provided; skipping")
-                continue
-            scorers.append(
-                LLMJudgeScorer(
-                    provider=judge_config["provider"],
-                    model=judge_config.get("model"),
-                    api_key=judge_config.get("api_key"),
-                    base_url=judge_config.get("base_url"),
-                )
-            )
+        resolved = ALIASES.get(name, name)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+
+        if resolved == "answer_relevancy":
+            scorers.append(AnswerRelevancyScorer(model=judge_model))
+        elif resolved == "correctness":
+            scorers.append(CorrectnessScorer(model=judge_model))
+        elif resolved == "faithfulness":
+            scorers.append(FaithfulnessScorer(model=judge_model))
+        elif resolved == "hallucination":
+            scorers.append(HallucinationScorer(model=judge_model))
         else:
             logger.warning("Unknown metric %r; skipping", name)
     return scorers
