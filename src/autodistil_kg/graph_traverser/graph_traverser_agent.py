@@ -35,6 +35,20 @@ def _short_id(node_id: str, max_len: int = 24) -> str:
     return f"{s[:max_len]}..." if len(s) > max_len else s
 
 
+def _emit_traversal_event(event_type: str, **data) -> None:
+    """Emit a structured traversal progress event via the logging system.
+
+    The API layer detects the ``traversal_event`` extra field and forwards it
+    to WebSocket clients as a ``traversal_progress`` event so the UI can render
+    live visualisations.
+    """
+    logger.info(
+        "traversal:%s",
+        event_type,
+        extra={"traversal_event": {"type": event_type, **data}},
+    )
+
+
 class GraphTraverserAgent:
     """
     Semantic-aware agent that traverses a Knowledge Graph and creates
@@ -65,6 +79,8 @@ class GraphTraverserAgent:
         self.dataset = ChatMLDataset()
         self.visited_count = 0
         self.current_depth = 0
+        self._checkpoint_path = self.config.dataset.output_path
+        self._last_checkpoint_idx = 0  # index into dataset.conversations already flushed
     
     def traverse(self) -> ChatMLDataset:
         """
@@ -74,7 +90,10 @@ class GraphTraverserAgent:
             ChatMLDataset containing all generated conversations
         """
         logger.info("Starting graph traversal...")
-        
+
+        # Resume from checkpoint if available
+        self._load_checkpoint()
+
         # Connect to all services
         self._connect_services()
         
@@ -93,6 +112,13 @@ class GraphTraverserAgent:
                 self.config.traversal.max_nodes,
                 self.config.traversal.max_depth,
             )
+            _emit_traversal_event(
+                "traversal_start",
+                strategy=self.config.traversal.strategy.value,
+                seed_nodes=len(start_nodes),
+                max_nodes=self.config.traversal.max_nodes,
+                max_depth=self.config.traversal.max_depth,
+            )
 
             # Traverse based on strategy
             if self.config.traversal.strategy == TraversalStrategy.BFS:
@@ -109,6 +135,12 @@ class GraphTraverserAgent:
                 raise ValueError(f"Unknown traversal strategy: {self.config.traversal.strategy}")
             
             logger.info(f"Traversal complete. Generated {len(self.dataset)} conversations.")
+            _emit_traversal_event(
+                "traversal_complete",
+                visited=self.visited_count,
+                dataset_size=len(self.dataset),
+                strategy=self.config.traversal.strategy.value,
+            )
             
             # Save dataset if output path is specified
             if self.config.dataset.output_path:
@@ -387,6 +419,15 @@ class GraphTraverserAgent:
             self.current_depth,
             reasoning_depth,
         )
+        _emit_traversal_event(
+            "node_start",
+            node_id=_short_id(node_id),
+            depth=self.current_depth,
+            visited=self.visited_count + 1,
+            total=self.config.traversal.max_nodes or 0,
+            step="querying_subgraph",
+            reasoning_depth=reasoning_depth,
+        )
 
         self._mark_in_progress(node_id)
 
@@ -411,6 +452,16 @@ class GraphTraverserAgent:
             "  Subgraph: %d nodes, %d edges, %d paths",
             len(nodes_map), len(edges), len(paths),
         )
+        _emit_traversal_event(
+            "subgraph_loaded",
+            node_id=_short_id(node_id),
+            labels=center.get("labels", []),
+            node_count=len(nodes_map),
+            edge_count=len(edges),
+            path_count=len(paths),
+            visited=self.visited_count + 1,
+            total=self.config.traversal.max_nodes or 0,
+        )
 
         # Deduplicate paths by their string representation to avoid redundant reasoning
         unique_paths = []
@@ -432,9 +483,15 @@ class GraphTraverserAgent:
         # Step 2: Reason through each path
         path_analyses = []
         for i, path in enumerate(unique_paths):
-            logger.debug(
-                "  Path %d/%d: %s",
-                i + 1, len(unique_paths), format_path_description(path)[:100],
+            path_desc = format_path_description(path)[:120]
+            logger.debug("  Path %d/%d: %s", i + 1, len(unique_paths), path_desc)
+            _emit_traversal_event(
+                "path_reasoning",
+                node_id=_short_id(node_id),
+                path_index=i + 1,
+                total_paths=len(unique_paths),
+                path_description=path_desc,
+                step="llm_reasoning",
             )
             analysis = self._reason_through_path(center, path)
             if analysis:
@@ -447,12 +504,23 @@ class GraphTraverserAgent:
 
         # Step 3: Synthesize all path reasonings
         logger.info("  Synthesizing %d path analyses...", len(path_analyses))
+        _emit_traversal_event(
+            "synthesis",
+            node_id=_short_id(node_id),
+            path_analyses_count=len(path_analyses),
+            step="llm_synthesizing",
+        )
         synthesis = self._synthesize_subgraph(
             center, path_analyses, len(nodes_map), len(edges)
         )
 
         # Step 4: Generate distillation QA pair
         logger.info("  Generating QA pair for distillation...")
+        _emit_traversal_event(
+            "qa_generation",
+            node_id=_short_id(node_id),
+            step="llm_generating_qa",
+        )
         qa_pair = self._generate_reasoning_qa(center, synthesis)
 
         # Create CHATML conversations
@@ -496,9 +564,21 @@ class GraphTraverserAgent:
             logger.warning("Failed to persist visited state for %s: %s", _short_id(node_id), e)
         self.visited_count += 1
 
+        self._checkpoint()
+
         logger.info(
             "  ✓ Node %s done → 2 conversations (visited=%d)",
             _short_id(node_id), self.visited_count,
+        )
+        _emit_traversal_event(
+            "node_done",
+            node_id=_short_id(node_id),
+            visited=self.visited_count,
+            total=self.config.traversal.max_nodes or 0,
+            dataset_size=len(self.dataset),
+            labels=center.get("labels", []),
+            paths_analyzed=len(path_analyses),
+            conversations=2,
         )
 
     def _reason_through_path(
@@ -676,6 +756,14 @@ class GraphTraverserAgent:
             _short_id(node_id),
             self.current_depth,
         )
+        _emit_traversal_event(
+            "node_start",
+            node_id=_short_id(node_id),
+            depth=self.current_depth,
+            visited=self.visited_count + 1,
+            total=self.config.traversal.max_nodes or 0,
+            step="querying",
+        )
 
         self._mark_in_progress(node_id)
 
@@ -691,9 +779,16 @@ class GraphTraverserAgent:
         # Generate prompt using seed prompts or default
         prompt = self._generate_prompt(node, neighbors)
         
-        logger.debug("Calling LLM for response...")
+        _emit_traversal_event(
+            "node_start",
+            node_id=_short_id(node_id),
+            depth=self.current_depth,
+            visited=self.visited_count + 1,
+            total=self.config.traversal.max_nodes or 0,
+            step="llm_generating",
+            labels=node.get("labels", []),
+        )
         response = self._generate_response(node, neighbors, prompt)
-        logger.debug("LLM response received")
         
         # Create CHATML conversation
         metadata = {
@@ -719,11 +814,21 @@ class GraphTraverserAgent:
             logger.warning("Failed to persist visited state for %s: %s", _short_id(node_id), e)
         self.visited_count += 1
 
+        self._checkpoint()
+
         logger.info(
             "  ✓ Node %s done → Redis (visited=%d, labels=%s)",
             _short_id(node_id),
             self.visited_count,
             node.get("labels", []),
+        )
+        _emit_traversal_event(
+            "node_done",
+            node_id=_short_id(node_id),
+            visited=self.visited_count,
+            total=self.config.traversal.max_nodes or 0,
+            dataset_size=len(self.dataset),
+            labels=node.get("labels", []),
         )
     
     def _generate_prompt(
@@ -821,6 +926,49 @@ class GraphTraverserAgent:
         except Exception as e:
             logger.debug(f"Could not persist skipped state for {node_id}: {e}")
 
+    def _checkpoint(self) -> None:
+        """Flush new conversations to disk since the last checkpoint.
+
+        This ensures that work is not lost if the process crashes mid-traversal.
+        Uses append mode so each call only writes new conversations.
+        """
+        if not self._checkpoint_path:
+            return
+        new_convs = self.dataset.conversations[self._last_checkpoint_idx:]
+        if not new_convs:
+            return
+        self.dataset.append_jsonl(self._checkpoint_path, new_convs)
+        self._last_checkpoint_idx = len(self.dataset.conversations)
+        logger.debug(
+            "Checkpoint: appended %d conversations to %s (total %d)",
+            len(new_convs), self._checkpoint_path, self._last_checkpoint_idx,
+        )
+
+    def _load_checkpoint(self) -> None:
+        """Resume from an existing checkpoint file if one exists.
+
+        Loads previously saved conversations so they are included in the final
+        dataset. The Redis state storage already tracks visited nodes, so those
+        nodes will be skipped during traversal automatically.
+        """
+        if not self._checkpoint_path:
+            return
+        from pathlib import Path
+        path = Path(self._checkpoint_path)
+        if not path.exists() or path.stat().st_size == 0:
+            return
+        try:
+            prev = ChatMLDataset()
+            prev.load_jsonl(str(path))
+            self.dataset = prev
+            self._last_checkpoint_idx = len(self.dataset.conversations)
+            logger.info(
+                "Resumed from checkpoint: loaded %d conversations from %s",
+                len(self.dataset), self._checkpoint_path,
+            )
+        except Exception as e:
+            logger.warning("Could not load checkpoint %s: %s — starting fresh", self._checkpoint_path, e)
+
     def _should_stop(self) -> bool:
         """Check if traversal should stop."""
         if self.config.traversal.max_nodes:
@@ -828,7 +976,12 @@ class GraphTraverserAgent:
         return False
     
     def _save_dataset(self) -> None:
-        """Save the dataset to file."""
+        """Save the final dataset to file.
+
+        If incremental checkpointing was active and all conversations have
+        already been flushed, this rewrites the file to ensure a clean
+        output (no duplicate lines from appending to a resumed checkpoint).
+        """
         path = self.config.dataset.output_path
         if self.config.dataset.output_format == "jsonl":
             self.dataset.save_jsonl(path)

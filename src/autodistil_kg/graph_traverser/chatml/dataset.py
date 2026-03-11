@@ -75,6 +75,19 @@ class ChatMLDataset:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.to_jsonl(), encoding="utf-8")
         logger.info(f"Saved {len(self.conversations)} conversations to {path}")
+
+    def append_jsonl(self, filepath: str, conversations: "List[ChatMLConversation]") -> None:
+        """Append conversations to a JSONL file (incremental checkpoint).
+
+        Creates the file and parent directories if they don't exist.
+        """
+        if not conversations:
+            return
+        path = Path(filepath).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for conv in conversations:
+                f.write(json.dumps(conv.to_dict()) + "\n")
     
     def save_json(self, filepath: str) -> None:
         """Save dataset to a JSON file. Creates parent directories if needed."""
